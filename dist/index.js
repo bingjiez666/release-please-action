@@ -46548,6 +46548,7 @@ exports.getChangelogTypes = getChangelogTypes;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getPluginTypes = exports.unregisterPlugin = exports.registerPlugin = exports.buildPlugin = void 0;
 const linked_versions_1 = __nccwpck_require__(59641);
+const release_dependencies_1 = __nccwpck_require__(26006);
 const cargo_workspace_1 = __nccwpck_require__(77430);
 const node_workspace_1 = __nccwpck_require__(23256);
 const maven_workspace_1 = __nccwpck_require__(66113);
@@ -46555,6 +46556,7 @@ const errors_1 = __nccwpck_require__(93637);
 const sentence_case_1 = __nccwpck_require__(36662);
 const group_priority_1 = __nccwpck_require__(83172);
 const pluginFactories = {
+    'release-dependencies': options => new release_dependencies_1.ReleaseDependencies(options.github, options.targetBranch, options.repositoryConfig, options.type.rules, options.separatePullRequests),
     'linked-versions': options => 
     // NOTE: linked-versions had already have a different behavior about merging
     // see test/plugins/compatibility/linked-versions-workspace.ts
@@ -48220,6 +48222,7 @@ const factory_1 = __nccwpck_require__(75695);
 const merge_1 = __nccwpck_require__(90514);
 const release_please_manifest_1 = __nccwpck_require__(9817);
 const errors_1 = __nccwpck_require__(93637);
+const release_dependencies_1 = __nccwpck_require__(26006);
 const pull_request_overflow_handler_1 = __nccwpck_require__(93937);
 const signoff_commit_message_1 = __nccwpck_require__(2686);
 const commit_exclude_1 = __nccwpck_require__(14702);
@@ -48384,7 +48387,6 @@ class Manifest {
      * @returns {ReleasePullRequest[]} The candidate pull requests to open or update.
      */
     async buildPullRequests() {
-        var _a;
         this.logger.info('Building pull requests');
         const pathsByComponent = await this.getPathsByComponent();
         const strategiesByPath = await this.getStrategiesByPath();
@@ -48464,15 +48466,10 @@ class Manifest {
         const releaseShas = new Set(Object.values(releaseShasByPath));
         this.logger.debug(releaseShas);
         const expectedShas = releaseShas.size;
-        // sha => release pull request
-        const releasePullRequestsBySha = {};
         let releaseCommitsFound = 0;
         for await (const commit of commitGenerator) {
             if (releaseShas.has(commit.sha)) {
-                if (commit.pullRequest) {
-                    releasePullRequestsBySha[commit.sha] = commit.pullRequest;
-                }
-                else {
+                if (!commit.pullRequest) {
                     this.logger.warn(`Release SHA ${commit.sha} did not have an associated pull request`);
                 }
                 releaseCommitsFound += 1;
@@ -48534,49 +48531,55 @@ class Manifest {
         for (const plugin of this.plugins) {
             strategies = await plugin.preconfigure(strategies, commitsPerPath, releasesByPath);
         }
-        let newReleasePullRequests = [];
-        for (const path in this.repositoryConfig) {
-            const config = this.repositoryConfig[path];
-            this.logger.info(`Building candidate release pull request for path: ${path}`);
-            this.logger.debug(`type: ${config.releaseType}`);
-            this.logger.debug(`targetBranch: ${this.targetBranch}`);
-            let pathCommits = (0, commit_1.parseConventionalCommits)(commitsPerPath[path], this.logger);
-            // The processCommits hook can be implemented by plugins to
-            // post-process commits. This can be used to perform cleanup, e.g,, sentence
-            // casing all commit messages:
-            for (const plugin of this.plugins) {
-                pathCommits = plugin.processCommits(pathCommits);
-            }
-            this.logger.debug(`commits: ${pathCommits.length}`);
-            const latestReleasePullRequest = releasePullRequestsBySha[releaseShasByPath[path]];
-            if (!latestReleasePullRequest) {
-                this.logger.warn('No latest release pull request found.');
-            }
-            const strategy = strategies[path];
-            const latestRelease = releasesByPath[path];
-            const releasePullRequest = await strategy.buildReleasePullRequest(pathCommits, latestRelease, (_a = config.draftPullRequest) !== null && _a !== void 0 ? _a : this.draftPullRequest, this.labels);
-            if (releasePullRequest) {
-                // Update manifest, but only for valid release version - this will skip SNAPSHOT from java strategy
-                if (releasePullRequest.version &&
-                    isPublishedVersion(strategy, releasePullRequest.version)) {
-                    const versionsMap = new Map();
-                    versionsMap.set(path, releasePullRequest.version);
-                    releasePullRequest.updates.push({
-                        path: this.manifestPath,
-                        createIfMissing: false,
-                        updater: new release_please_manifest_1.ReleasePleaseManifest({
-                            version: releasePullRequest.version,
-                            versionsMap,
-                        }),
-                    });
-                }
-                newReleasePullRequests.push({
-                    path,
-                    config,
-                    pullRequest: releasePullRequest,
-                });
-            }
+        const releaseDependencies = this.plugins.filter((plugin) => plugin instanceof release_dependencies_1.ReleaseDependencies);
+        if (releaseDependencies.length > 1) {
+            throw new errors_1.ConfigurationError('Only one release-dependencies plugin may be configured', 'release-dependencies', `${this.repository.owner}/${this.repository.repo}`);
         }
+        // Rebuild candidates from their original commits when dependencies force a
+        // new version. Workspace plugins can themselves create source candidates,
+        // and can merge their candidates, so resolving only once before or after
+        // them would miss cross-workspace dependencies or downstream workspace bumps.
+        const buildCandidates = async (versionOverrides) => {
+            var _a;
+            const candidates = [];
+            for (const path in this.repositoryConfig) {
+                const config = this.repositoryConfig[path];
+                let pathCommits = (0, commit_1.parseConventionalCommits)(commitsPerPath[path], this.logger);
+                for (const plugin of this.plugins) {
+                    pathCommits = plugin.processCommits(pathCommits);
+                }
+                const strategy = strategies[path];
+                const releasePullRequest = await strategy.buildReleasePullRequest(pathCommits, releasesByPath[path], (_a = config.draftPullRequest) !== null && _a !== void 0 ? _a : this.draftPullRequest, this.labels, versionOverrides.has(path)
+                    ? { newVersion: versionOverrides.get(path) }
+                    : undefined);
+                if (releasePullRequest) {
+                    if (versionOverrides.has(path) &&
+                        (!releasePullRequest.version ||
+                            !isPublishedVersion(strategy, releasePullRequest.version))) {
+                        throw new errors_1.ConfigurationError(`Forced release for ${path} has no publishable version`, 'release-dependencies', `${this.repository.owner}/${this.repository.repo}`);
+                    }
+                    if (releasePullRequest.version &&
+                        isPublishedVersion(strategy, releasePullRequest.version)) {
+                        const versionsMap = new Map();
+                        versionsMap.set(path, releasePullRequest.version);
+                        releasePullRequest.updates.push({
+                            path: this.manifestPath,
+                            createIfMissing: false,
+                            updater: new release_please_manifest_1.ReleasePleaseManifest({
+                                version: releasePullRequest.version,
+                                versionsMap,
+                            }),
+                        });
+                    }
+                    candidates.push({ path, config, pullRequest: releasePullRequest });
+                }
+                else if (versionOverrides.has(path)) {
+                    throw new errors_1.ConfigurationError(`Could not build forced release for ${path}`, 'release-dependencies', `${this.repository.owner}/${this.repository.repo}`);
+                }
+            }
+            return candidates;
+        };
+        const plugins = [...this.plugins];
         // Combine pull requests into 1 unless configured for separate
         // pull requests
         if (!this.separatePullRequests) {
@@ -48600,13 +48603,54 @@ class Manifest {
                     mergeOptions.componentNoSpace = config.componentNoSpace;
                 }
             }
-            this.plugins.push(new merge_1.Merge(this.github, this.targetBranch, this.repositoryConfig, mergeOptions));
+            plugins.push(new merge_1.Merge(this.github, this.targetBranch, this.repositoryConfig, mergeOptions));
         }
-        for (const plugin of this.plugins) {
-            this.logger.debug(`running plugin: ${plugin.constructor.name}`);
-            newReleasePullRequests = await plugin.run(newReleasePullRequests);
+        const versionOverrides = new Map();
+        let previousReasons = new Map();
+        for (let pass = 0; pass <= Object.keys(this.repositoryConfig).length * 2 + 1; pass++) {
+            let candidates = await buildCandidates(versionOverrides);
+            for (const plugin of plugins) {
+                this.logger.debug(`running plugin: ${plugin.constructor.name}`);
+                candidates = await plugin.run(candidates);
+            }
+            const dependencyPlugin = releaseDependencies[0];
+            if (!dependencyPlugin) {
+                return candidates.map(candidate => candidate.pullRequest);
+            }
+            await dependencyPlugin.addNotes(candidates, previousReasons, strategies);
+            const resolution = await dependencyPlugin.resolve(candidates, {
+                releasesByPath,
+                releasedVersions: this.releasedVersions,
+                strategiesByPath: strategies,
+            });
+            let changed = false;
+            for (const [path, version] of resolution.versions) {
+                const previous = versionOverrides.get(path);
+                if (!previous || version.compare(previous) > 0) {
+                    versionOverrides.set(path, version);
+                    changed = true;
+                }
+            }
+            const reasons = [...resolution.reasons].map(([path, entries]) => [
+                path,
+                ...entries,
+            ]);
+            const oldReasons = [...previousReasons].map(([path, entries]) => [
+                path,
+                ...entries,
+            ]);
+            if (!changed && JSON.stringify(reasons) === JSON.stringify(oldReasons)) {
+                for (const [path, required] of versionOverrides) {
+                    const observed = resolution.observedVersions.get(path);
+                    if (!observed || observed.compare(required) < 0) {
+                        throw new errors_1.ConfigurationError(`Required release for ${path} was filtered or is below ${required}`, 'release-dependencies', `${this.repository.owner}/${this.repository.repo}`);
+                    }
+                }
+                return candidates.map(candidate => candidate.pullRequest);
+            }
+            previousReasons = resolution.reasons;
         }
-        return newReleasePullRequests.map(pullRequestWithConfig => pullRequestWithConfig.pullRequest);
+        throw new errors_1.ConfigurationError('Release dependencies did not converge', 'release-dependencies', `${this.repository.owner}/${this.repository.repo}`);
     }
     async backfillReleasesFromTags(missingPaths, strategiesByPath) {
         const releasesByPath = {};
@@ -50483,6 +50527,9 @@ class Merge extends plugin_1.ManifestPlugin {
             }
             return collection;
         }, [[], []]);
+        if (inScopeCandidates.length === 0) {
+            return outOfScopeCandidates;
+        }
         const releaseData = [];
         const labels = new Set();
         let rawUpdates = [];
@@ -50890,6 +50937,231 @@ function getChangelogDepsNotes(original, updated, updateVersions, logger) {
     return '';
 }
 //# sourceMappingURL=node-workspace.js.map
+
+/***/ }),
+
+/***/ 26006:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ReleaseDependencies = void 0;
+const errors_1 = __nccwpck_require__(93637);
+const plugin_1 = __nccwpck_require__(31651);
+const changelog_1 = __nccwpck_require__(3325);
+const composite_1 = __nccwpck_require__(40911);
+const versioning_strategy_1 = __nccwpck_require__(41941);
+/**
+ * A release dependency is a directed edge between independently versioned
+ * manifest paths. A publishable source release candidate triggers a release
+ * of its dependent, just as a workspace package release triggers its dependents.
+ */
+class ReleaseDependencies extends plugin_1.ManifestPlugin {
+    constructor(github, targetBranch, repositoryConfig, rules, separatePullRequests = false) {
+        super(github, targetBranch, repositoryConfig);
+        // Related source and dependent versions must share a release PR. Otherwise
+        // a dependent PR could merge first and repeatedly release before its source.
+        if (separatePullRequests) {
+            throw this.error('release dependencies require a combined release pull request');
+        }
+        if (!Array.isArray(rules) || rules.length === 0) {
+            throw this.error('rules must be a non-empty array');
+        }
+        const edges = new Set();
+        for (const rule of rules) {
+            if (!rule ||
+                typeof rule.source !== 'string' ||
+                typeof rule.dependent !== 'string' ||
+                !Object.prototype.hasOwnProperty.call(repositoryConfig, rule.source) ||
+                !Object.prototype.hasOwnProperty.call(repositoryConfig, rule.dependent)) {
+                throw this.error('source and dependent must be configured manifest paths');
+            }
+            if (Object.keys(rule).some(key => !['source', 'dependent', 'minimumBump'].includes(key))) {
+                throw this.error(`unsupported release dependency rule field for ${rule.source} -> ${rule.dependent}`);
+            }
+            if (rule.source === rule.dependent) {
+                throw this.error(`self-dependency: ${rule.source}`);
+            }
+            if (repositoryConfig[rule.source].separatePullRequests ||
+                repositoryConfig[rule.dependent].separatePullRequests) {
+                throw this.error(`release dependency ${rule.source} -> ${rule.dependent} requires a combined release pull request`);
+            }
+            if (rule.minimumBump !== undefined &&
+                !['patch', 'minor', 'major'].includes(rule.minimumBump)) {
+                throw this.error(`invalid minimumBump for ${rule.source} -> ${rule.dependent}`);
+            }
+            if (repositoryConfig[rule.dependent].skipGithubRelease) {
+                throw this.error(`dependent ${rule.dependent} cannot skip its GitHub release`);
+            }
+            const edge = `${rule.source}\0${rule.dependent}`;
+            if (edges.has(edge)) {
+                throw this.error(`duplicate release dependency: ${rule.source} -> ${rule.dependent}`);
+            }
+            edges.add(edge);
+        }
+        this.rules = [...rules].sort((a, b) => (a.dependent < b.dependent ? -1 : a.dependent > b.dependent ? 1 : 0) ||
+            (a.source < b.source ? -1 : a.source > b.source ? 1 : 0));
+        this.order = this.topologicalOrder();
+    }
+    async resolve(candidates, context) {
+        var _a, _b;
+        const pathsByComponent = new Map();
+        for (const path of Object.keys(this.repositoryConfig)) {
+            const component = (await context.strategiesByPath[path].getComponent()) || '';
+            const other = pathsByComponent.get(component);
+            if (other && other !== path) {
+                throw this.error(`ambiguous release component ${component}: ${other}, ${path}`);
+            }
+            pathsByComponent.set(component, path);
+        }
+        const candidateVersions = new Map();
+        for (const candidate of candidates) {
+            for (const data of candidate.pullRequest.body.releaseData) {
+                const path = pathsByComponent.get(data.component || '');
+                if (path && data.version) {
+                    const strategy = context.strategiesByPath[path];
+                    if (strategy.isPublishedVersion &&
+                        !strategy.isPublishedVersion(data.version)) {
+                        continue;
+                    }
+                    const current = candidateVersions.get(path);
+                    if (!current || data.version.compare(current) > 0) {
+                        candidateVersions.set(path, data.version);
+                    }
+                }
+            }
+        }
+        // Keep the versions actually present in the generated PR separate from
+        // the synthetic versions needed to propagate through dependency chains.
+        const observedVersions = new Map(candidateVersions);
+        const versions = new Map();
+        const reasons = new Map();
+        for (const path of this.order) {
+            for (const rule of this.rules.filter(rule => rule.dependent === path)) {
+                if (!candidateVersions.has(rule.source)) {
+                    continue;
+                }
+                const previousVersion = (_a = context.releasedVersions[path]) !== null && _a !== void 0 ? _a : (_b = context.releasesByPath[path]) === null || _b === void 0 ? void 0 : _b.tag.version;
+                if (!previousVersion) {
+                    throw this.error(`missing previously released version for ${path}`);
+                }
+                const required = this.bump(previousVersion, rule.minimumBump || 'patch');
+                const existing = candidateVersions.get(path);
+                if (existing &&
+                    context.strategiesByPath[path].isPublishedVersion &&
+                    !context.strategiesByPath[path].isPublishedVersion(existing)) {
+                    throw this.error(`dependent ${path} has no publishable release candidate`);
+                }
+                if (!existing || existing.compare(required) < 0) {
+                    candidateVersions.set(path, required);
+                    versions.set(path, required);
+                }
+                reasons.set(path, [
+                    ...(reasons.get(path) || []),
+                    `Release of \`${rule.source}\``,
+                ]);
+            }
+        }
+        return { versions, reasons, observedVersions };
+    }
+    /** Add traceable notes without manufacturing a conventional commit. */
+    async addNotes(candidates, reasons, strategiesByPath) {
+        for (const [path, entries] of reasons) {
+            const component = (await strategiesByPath[path].getComponent()) || '';
+            const note = `### Release Dependencies\n\n${entries
+                .map(entry => `* ${entry}`)
+                .join('\n')}`;
+            const configuredChangelogPath = this.repositoryConfig[path].changelogPath || 'CHANGELOG.md';
+            const changelogPath = configuredChangelogPath.startsWith('/')
+                ? configuredChangelogPath.replace(/^\/+/, '')
+                : `${path === '.' ? '' : `${path}/`}${configuredChangelogPath}`;
+            for (const candidate of candidates) {
+                const data = candidate.pullRequest.body.releaseData.find(data => (data.component || '') === component);
+                if (!data)
+                    continue;
+                if (!data.version) {
+                    throw this.error(`release dependency ${path} has no version`);
+                }
+                data.notes = `${data.notes.trim()}\n\n${note}`.trim();
+                for (const update of candidate.pullRequest.updates) {
+                    if (update.path === changelogPath) {
+                        this.addChangelogNote(update, note, data.version);
+                    }
+                }
+            }
+        }
+    }
+    addChangelogNote(update, note, version) {
+        const changelogs = this.changelogUpdaters(update.updater);
+        const matching = changelogs.filter(updater => updater.version.compare(version) === 0);
+        if (changelogs.length > 0 && matching.length !== 1) {
+            throw this.error(`cannot identify the ${version} changelog update at ${update.path}`);
+        }
+        if (matching.length === 1) {
+            matching[0].changelogEntry =
+                `${matching[0].changelogEntry.trim()}\n\n${note}`.trim();
+        }
+    }
+    changelogUpdaters(updater) {
+        if (updater instanceof changelog_1.Changelog)
+            return [updater];
+        if (updater instanceof composite_1.CompositeUpdater) {
+            return updater.updaters.flatMap(part => this.changelogUpdaters(part));
+        }
+        return [];
+    }
+    bump(version, kind) {
+        switch (kind) {
+            case 'major':
+                return new versioning_strategy_1.MajorVersionUpdate().bump(version);
+            case 'minor':
+                return new versioning_strategy_1.MinorVersionUpdate().bump(version);
+            case 'patch':
+                return new versioning_strategy_1.PatchVersionUpdate().bump(version);
+        }
+    }
+    topologicalOrder() {
+        const visiting = new Set();
+        const visited = new Set();
+        const order = [];
+        const visit = (path) => {
+            if (visiting.has(path)) {
+                throw this.error(`cycle in release dependencies at ${path}`);
+            }
+            if (visited.has(path))
+                return;
+            visiting.add(path);
+            for (const rule of this.rules.filter(rule => rule.dependent === path)) {
+                visit(rule.source);
+            }
+            visiting.delete(path);
+            visited.add(path);
+            order.push(path);
+        };
+        for (const path of Object.keys(this.repositoryConfig).sort())
+            visit(path);
+        return order;
+    }
+    error(message) {
+        return new errors_1.ConfigurationError(message, 'release-dependencies', `${this.github.repository.owner}/${this.github.repository.repo}`);
+    }
+}
+exports.ReleaseDependencies = ReleaseDependencies;
+//# sourceMappingURL=release-dependencies.js.map
 
 /***/ }),
 
@@ -53034,13 +53306,16 @@ class Java extends base_1.BaseStrategy {
         this.snapshotLabels = options.snapshotLabels || manifest_1.DEFAULT_SNAPSHOT_LABELS;
         this.skipSnapshot = (_c = options.skipSnapshot) !== null && _c !== void 0 ? _c : false;
     }
-    async buildReleasePullRequest(commits, latestRelease, draft, labels = [], _bumpOnlyOptions) {
-        if (await this.needsSnapshot(commits, latestRelease)) {
+    async buildReleasePullRequest(commits, latestRelease, draft, labels = [], bumpOnlyOptions) {
+        // A dependency-forced release must produce its publishable version, not
+        // the usual preparatory SNAPSHOT candidate.
+        if (!bumpOnlyOptions &&
+            (await this.needsSnapshot(commits, latestRelease))) {
             this.logger.info('Repository needs a snapshot bump.');
             return await this.buildSnapshotPullRequest(latestRelease, draft, this.snapshotLabels);
         }
         this.logger.info('No Java snapshot needed');
-        return await super.buildReleasePullRequest(commits, latestRelease, draft, labels);
+        return await super.buildReleasePullRequest(commits, latestRelease, draft, labels, bumpOnlyOptions);
     }
     async buildSnapshotPullRequest(latestRelease, draft, labels = []) {
         const component = await this.getComponent();
@@ -53554,7 +53829,7 @@ class PHPYoshi extends base_1.BaseStrategy {
         });
     }
     async buildReleasePullRequest(commits, latestRelease, draft, labels = [], bumpOnlyOptions) {
-        var _a, _b, _c;
+        var _a, _b, _c, _d;
         const conventionalCommits = await this.postProcessCommits((0, commit_1.parseConventionalCommits)(commits, this.logger));
         if (!bumpOnlyOptions && conventionalCommits.length === 0) {
             this.logger.info(`No commits for path: ${this.path}, skipping`);
@@ -53567,9 +53842,9 @@ class PHPYoshi extends base_1.BaseStrategy {
                 versionOverrides[directory] = version;
             });
         });
-        const newVersion = latestRelease
+        const newVersion = (_a = bumpOnlyOptions === null || bumpOnlyOptions === void 0 ? void 0 : bumpOnlyOptions.newVersion) !== null && _a !== void 0 ? _a : (latestRelease
             ? await this.versioningStrategy.bump(latestRelease.tag.version, conventionalCommits)
-            : this.initialReleaseVersion();
+            : this.initialReleaseVersion());
         const cs = new commit_split_1.CommitSplit();
         const splitCommits = cs.split(conventionalCommits);
         const topLevelDirectories = Object.keys(splitCommits).sort();
@@ -53595,7 +53870,7 @@ class PHPYoshi extends base_1.BaseStrategy {
                     owner: this.repository.owner,
                     repository: this.repository.repo,
                     version: newVersion.toString(),
-                    previousTag: (_a = latestRelease === null || latestRelease === void 0 ? void 0 : latestRelease.tag) === null || _a === void 0 ? void 0 : _a.toString(),
+                    previousTag: (_b = latestRelease === null || latestRelease === void 0 ? void 0 : latestRelease.tag) === null || _b === void 0 ? void 0 : _b.toString(),
                     currentTag: newVersionTag.toString(),
                     targetBranch: this.targetBranch,
                     changelogSections: this.changelogSections,
@@ -53647,7 +53922,7 @@ class PHPYoshi extends base_1.BaseStrategy {
                     version,
                 }),
             });
-            if ((_c = (_b = componentInfo.composer.extra) === null || _b === void 0 ? void 0 : _b.component) === null || _c === void 0 ? void 0 : _c.entry) {
+            if ((_d = (_c = componentInfo.composer.extra) === null || _c === void 0 ? void 0 : _c.component) === null || _d === void 0 ? void 0 : _d.entry) {
                 updates.push({
                     path: this.addPath(`${directory}/${componentInfo.composer.extra.component.entry}`),
                     createIfMissing: false,
@@ -53676,11 +53951,21 @@ class PHPYoshi extends base_1.BaseStrategy {
         };
     }
     async parsePullRequestBody(pullRequestBody) {
+        var _a;
         const body = pull_request_body_1.PullRequestBody.parse(pullRequestBody, this.logger);
         if (!body) {
             return undefined;
         }
         const component = await this.getComponent();
+        // A manifest PR carries one version per component. The historical PHP
+        // aggregate PR instead starts its notes with a top-level version heading
+        // before the individual module details; keep its legacy parsing.
+        const notesSection = (_a = pullRequestBody
+            .replace(/\r\n/g, '\n')
+            .split('\n---\n')[1]) === null || _a === void 0 ? void 0 : _a.trimStart();
+        if (body.useComponents && !/^## \d+\.\d+\.\d+/.test(notesSection || '')) {
+            return body;
+        }
         const notes = body.releaseData
             .map(release => {
             var _a;
@@ -105483,7 +105768,7 @@ module.exports = {"i8":"17.3.0"};
 /***/ ((module) => {
 
 "use strict";
-module.exports = JSON.parse('{"$schema":"http://json-schema.org/draft-07/schema#","title":"release-please manifest config schema","description":"Schema for defining manifest config file","type":"object","additionalProperties":false,"definitions":{"ReleaserConfigOptions":{"type":"object","properties":{"release-type":{"description":"The strategy to use for this component.","type":"string"},"bump-minor-pre-major":{"description":"Breaking changes only bump semver minor if version < 1.0.0","type":"boolean"},"bump-patch-for-minor-pre-major":{"description":"Feature changes only bump semver patch if version < 1.0.0","type":"boolean"},"prerelease-type":{"description":"Configuration option for the prerelease versioning strategy. If prerelease strategy used and type set, will set the prerelease part of the version to the provided value in case prerelease part is not present.","type":"string"},"versioning":{"description":"Versioning strategy. Defaults to `default`","type":"string"},"changelog-sections":{"description":"Override the Changelog configuration sections","type":"array","items":{"type":"object","properties":{"type":{"description":"Semantic commit type (e.g. `feat`, `chore`)","type":"string"},"section":{"description":"Changelog section title","type":"string"},"hidden":{"description":"Skip displaying this type of commit. Defaults to `false`.","type":"boolean"}},"required":["type","section"]}},"release-as":{"description":"[DEPRECATED] Override the next version of this package. Consider using a `Release-As` commit instead.","type":"string"},"skip-github-release":{"description":"Skip tagging GitHub releases for this package. Release-Please still requires releases to be tagged, so this option should only be used if you have existing infrastructure to tag these releases.Defaults to `false`.","type":"boolean"},"skip-changelog":{"description":"Skip generating a changelog for this package. Defaults to `false`.","type":"boolean"},"draft":{"description":"Create the GitHub release in draft mode. Defaults to `false`.","type":"boolean"},"force-tag-creation":{"description":"Force the creation of a Git tag for the release. This is particularly useful when `draft` is enabled, because GitHub does not create a Git tag for draft releases until they are published. This \'lazy tag creation\' causes release-please to fail to find the previous release, potentially generating incorrect changelogs. Setting this to `true` ensures the tag is created immediately. Defaults to `false`.","type":"boolean"},"prerelease":{"description":"Create the GitHub release as prerelease. Defaults to `false`.","type":"boolean"},"draft-pull-request":{"description":"Open the release pull request in draft mode. Defaults to `false`.","type":"boolean"},"extra-label":{"description":"Comma-separated list of labels to add to a newly opened pull request","type":"string"},"include-component-in-tag":{"description":"When tagging a release, include the component name as part of the tag. Defaults to `true`.","type":"boolean"},"include-v-in-tag":{"description":"When tagging a release, include `v` in the tag. Defaults to `true`.","type":"boolean"},"include-v-in-release-name":{"description":"Include `v` in the GitHub release name. Defaults to `true`.","type":"boolean"},"changelog-type":{"description":"The type of changelog to use. Defaults to `default`.","type":"string","enum":["default","github"]},"changelog-host":{"description":"Generate changelog links to this GitHub host. Useful for running against GitHub Enterprise.","type":"string"},"changelog-path":{"description":"Path to the file that tracks release note changes. Defaults to `CHANGELOG.md`.","type":"string"},"pull-request-title-pattern":{"description":"Customize the release pull request title.","type":"string"},"pull-request-header":{"description":"Customize the release pull request header.","type":"string"},"pull-request-footer":{"description":"Customize the release pull request footer.","type":"string"},"separate-pull-requests":{"description":"Open a separate release pull request for each component. Defaults to `false`.","type":"boolean"},"always-update":{"description":"Always update the pull request with the latest changes. Defaults to `false`.","type":"boolean"},"tag-separator":{"description":"Customize the separator between the component and version in the GitHub tag.","type":"string"},"date-format":{"description":"Date format given as a strftime expression for the generic strategy.","type":"string"},"extra-files":{"description":"Specify extra generic files to replace versions.","type":"array","items":{"anyOf":[{"description":"The path to the file. The `Generic` updater uses annotations to replace versions.","type":"string"},{"description":"An extra JSON, YAML, or TOML file with a targeted update via jsonpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["json","toml","yaml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"jsonpath":{"description":"The jsonpath to the version entry in the file.","type":"string"}},"required":["type","path","jsonpath"]},{"description":"An extra XML file with a targeted update via xpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["xml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"xpath":{"description":"The xpath to the version entry in the file.","type":"string"}},"required":["type","path","xpath"]},{"description":"An extra pom.xml file.","type":"object","properties":{"type":{"description":"The file format type.","enum":["pom"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]},{"description":"An extra arbitrary file that includes release-please generic updater\'s annotation.","type":"object","properties":{"type":{"description":"The file format type.","enum":["generic"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]}]}},"exclude-paths":{"description":"Path of commits to be excluded from parsing. If all files from commit belong to one of the paths it will be skipped","type":"array","items":{"type":"string"}},"version-file":{"description":"Path to the specialize version file. Used by `ruby` and `simple` strategies.","type":"string"},"snapshot-label":{"description":"Label to add to snapshot pull request. Used by `java` strategies.","type":"string"},"skip-snapshot":{"description":"If set, do not propose snapshot pull requests. Used by `java` strategies.","type":"boolean"},"initial-version":{"description":"Releases the initial library with a specified version","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}}}},"allOf":[{"$ref":"#/definitions/ReleaserConfigOptions"},{"properties":{"$schema":{"description":"Path to the release-please manifest config schema","type":"string","format":"uri-reference"},"packages":{"description":"Per-path component configuration.","type":"object","additionalProperties":{"$ref":"#/definitions/ReleaserConfigOptions"}},"bootstrap-sha":{"description":"For the initial release of a library, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"last-release-sha":{"description":"For any release, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"always-link-local":{"description":"When using the `node-workspace` plugin, force all local dependencies to be linked.","type":"boolean"},"plugins":{"description":"Plugins to apply to pull requests. Plugins can be added to perform extra release processing that cannot be achieved by an individual release strategy.","type":"array","items":{"anyOf":[{"description":"The plugin name for plugins that do not require other options.","type":"string"},{"description":"Configuration for the `linked-versions` plugin.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["linked-versions"]},"groupName":{"description":"The name of the group of components.","type":"string"},"components":{"description":"List of component names that are part of this group.","type":"array","items":{"type":"string"}},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"specialWords":{"description":"Words that sentence casing logic will not be applied to","type":"array","items":{"type":"string"}}},"required":["type","groupName","components"]},{"description":"Configuration for the `cargo-workspace` plugin.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["cargo-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"cargoWorkspacePath":{"description":"Path to the directory containing the workspace Cargo.toml. Defaults to the repository root.","type":"string"}}},{"description":"Configuration for the `maven-workspace` plugin.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["maven-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"}}},{"description":"Configuration for various `workspace` plugins.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["node-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"},"updatePeerDependencies":{"description":"Also bump peer dependency versions if they are modified. Defaults to `false`.","type":"boolean"}}},{"description":"Configuration for various `group-priority` plugin","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["group-priority"]},"groups":{"description":"Group names ordered with highest priority first.","type":"array","items":{"type":"string"}}}},{"description":"Other plugins","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string"}}}]}},"signoff":{"description":"Text to be used as Signed-off-by in the commit.","type":"string"},"group-pull-request-title-pattern":{"description":"When grouping multiple release pull requests use this pattern for the title.","type":"string"},"release-search-depth":{"description":"When considering previously releases, only look this deep.","type":"number"},"commit-search-depth":{"description":"When considering commit history, only look this many commits deep.","type":"number"},"commit-batch-size":{"description":"Number of commits to fetch per API request when searching commit history. Lower values result in more API calls but may help avoid timeouts. Defaults to 10.","type":"number"},"sequential-calls":{"description":"Whether to open pull requests/releases sequentially rather than concurrently. If you have many components, you may want to set this to avoid secondary rate limits.","type":"boolean"},"label":{"description":"Comma-separated list of labels to add to newly opened pull request. These are used to identify release pull requests.","type":"string"},"release-label":{"description":"Comma-separated list of labels to add to a pull request that has been released/tagged","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}},"required":["packages"]}],"properties":{"$schema":true,"packages":true,"bootstrap-sha":true,"last-release-sha":true,"always-link-local":true,"plugins":true,"signoff":true,"group-pull-request-title-pattern":true,"release-search-depth":true,"commit-search-depth":true,"commit-batch-size":true,"sequential-calls":true,"release-type":true,"bump-minor-pre-major":true,"bump-patch-for-minor-pre-major":true,"versioning":true,"changelog-sections":true,"release-as":true,"skip-github-release":true,"skip-changelog":true,"draft":true,"force-tag-creation":true,"prerelease":true,"draft-pull-request":true,"label":true,"release-label":true,"extra-label":true,"include-component-in-tag":true,"include-v-in-tag":true,"include-v-in-release-name":true,"changelog-type":true,"changelog-host":true,"changelog-path":true,"pull-request-title-pattern":true,"pull-request-header":true,"pull-request-footer":true,"separate-pull-requests":true,"always-update":true,"tag-separator":true,"date-format":true,"extra-files":true,"version-file":true,"snapshot-label":true,"initial-version":true,"exclude-paths":true,"component-no-space":false}}');
+module.exports = JSON.parse('{"$schema":"http://json-schema.org/draft-07/schema#","title":"release-please manifest config schema","description":"Schema for defining manifest config file","type":"object","additionalProperties":false,"definitions":{"ReleaserConfigOptions":{"type":"object","properties":{"release-type":{"description":"The strategy to use for this component.","type":"string"},"bump-minor-pre-major":{"description":"Breaking changes only bump semver minor if version < 1.0.0","type":"boolean"},"bump-patch-for-minor-pre-major":{"description":"Feature changes only bump semver patch if version < 1.0.0","type":"boolean"},"prerelease-type":{"description":"Configuration option for the prerelease versioning strategy. If prerelease strategy used and type set, will set the prerelease part of the version to the provided value in case prerelease part is not present.","type":"string"},"versioning":{"description":"Versioning strategy. Defaults to `default`","type":"string"},"changelog-sections":{"description":"Override the Changelog configuration sections","type":"array","items":{"type":"object","properties":{"type":{"description":"Semantic commit type (e.g. `feat`, `chore`)","type":"string"},"section":{"description":"Changelog section title","type":"string"},"hidden":{"description":"Skip displaying this type of commit. Defaults to `false`.","type":"boolean"}},"required":["type","section"]}},"release-as":{"description":"[DEPRECATED] Override the next version of this package. Consider using a `Release-As` commit instead.","type":"string"},"skip-github-release":{"description":"Skip tagging GitHub releases for this package. Release-Please still requires releases to be tagged, so this option should only be used if you have existing infrastructure to tag these releases.Defaults to `false`.","type":"boolean"},"skip-changelog":{"description":"Skip generating a changelog for this package. Defaults to `false`.","type":"boolean"},"draft":{"description":"Create the GitHub release in draft mode. Defaults to `false`.","type":"boolean"},"force-tag-creation":{"description":"Force the creation of a Git tag for the release. This is particularly useful when `draft` is enabled, because GitHub does not create a Git tag for draft releases until they are published. This \'lazy tag creation\' causes release-please to fail to find the previous release, potentially generating incorrect changelogs. Setting this to `true` ensures the tag is created immediately. Defaults to `false`.","type":"boolean"},"prerelease":{"description":"Create the GitHub release as prerelease. Defaults to `false`.","type":"boolean"},"draft-pull-request":{"description":"Open the release pull request in draft mode. Defaults to `false`.","type":"boolean"},"extra-label":{"description":"Comma-separated list of labels to add to a newly opened pull request","type":"string"},"include-component-in-tag":{"description":"When tagging a release, include the component name as part of the tag. Defaults to `true`.","type":"boolean"},"include-v-in-tag":{"description":"When tagging a release, include `v` in the tag. Defaults to `true`.","type":"boolean"},"include-v-in-release-name":{"description":"Include `v` in the GitHub release name. Defaults to `true`.","type":"boolean"},"changelog-type":{"description":"The type of changelog to use. Defaults to `default`.","type":"string","enum":["default","github"]},"changelog-host":{"description":"Generate changelog links to this GitHub host. Useful for running against GitHub Enterprise.","type":"string"},"changelog-path":{"description":"Path to the file that tracks release note changes. Defaults to `CHANGELOG.md`.","type":"string"},"pull-request-title-pattern":{"description":"Customize the release pull request title.","type":"string"},"pull-request-header":{"description":"Customize the release pull request header.","type":"string"},"pull-request-footer":{"description":"Customize the release pull request footer.","type":"string"},"separate-pull-requests":{"description":"Open a separate release pull request for each component. Defaults to `false`.","type":"boolean"},"always-update":{"description":"Always update the pull request with the latest changes. Defaults to `false`.","type":"boolean"},"tag-separator":{"description":"Customize the separator between the component and version in the GitHub tag.","type":"string"},"date-format":{"description":"Date format given as a strftime expression for the generic strategy.","type":"string"},"extra-files":{"description":"Specify extra generic files to replace versions.","type":"array","items":{"anyOf":[{"description":"The path to the file. The `Generic` updater uses annotations to replace versions.","type":"string"},{"description":"An extra JSON, YAML, or TOML file with a targeted update via jsonpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["json","toml","yaml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"jsonpath":{"description":"The jsonpath to the version entry in the file.","type":"string"}},"required":["type","path","jsonpath"]},{"description":"An extra XML file with a targeted update via xpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["xml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"xpath":{"description":"The xpath to the version entry in the file.","type":"string"}},"required":["type","path","xpath"]},{"description":"An extra pom.xml file.","type":"object","properties":{"type":{"description":"The file format type.","enum":["pom"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]},{"description":"An extra arbitrary file that includes release-please generic updater\'s annotation.","type":"object","properties":{"type":{"description":"The file format type.","enum":["generic"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]}]}},"exclude-paths":{"description":"Path of commits to be excluded from parsing. If all files from commit belong to one of the paths it will be skipped","type":"array","items":{"type":"string"}},"version-file":{"description":"Path to the specialize version file. Used by `ruby` and `simple` strategies.","type":"string"},"snapshot-label":{"description":"Label to add to snapshot pull request. Used by `java` strategies.","type":"string"},"skip-snapshot":{"description":"If set, do not propose snapshot pull requests. Used by `java` strategies.","type":"boolean"},"initial-version":{"description":"Releases the initial library with a specified version","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}}}},"allOf":[{"$ref":"#/definitions/ReleaserConfigOptions"},{"properties":{"$schema":{"description":"Path to the release-please manifest config schema","type":"string","format":"uri-reference"},"packages":{"description":"Per-path component configuration.","type":"object","additionalProperties":{"$ref":"#/definitions/ReleaserConfigOptions"}},"bootstrap-sha":{"description":"For the initial release of a library, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"last-release-sha":{"description":"For any release, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"always-link-local":{"description":"When using the `node-workspace` plugin, force all local dependencies to be linked.","type":"boolean"},"plugins":{"description":"Plugins to apply to pull requests. Plugins can be added to perform extra release processing that cannot be achieved by an individual release strategy.","type":"array","items":{"anyOf":[{"description":"The plugin name for plugins that do not require other options.","type":"string"},{"description":"Configuration for the `linked-versions` plugin.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["linked-versions"]},"groupName":{"description":"The name of the group of components.","type":"string"},"components":{"description":"List of component names that are part of this group.","type":"array","items":{"type":"string"}},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"specialWords":{"description":"Words that sentence casing logic will not be applied to","type":"array","items":{"type":"string"}}},"required":["type","groupName","components"]},{"description":"Configuration for the `cargo-workspace` plugin.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["cargo-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"cargoWorkspacePath":{"description":"Path to the directory containing the workspace Cargo.toml. Defaults to the repository root.","type":"string"}}},{"description":"Configuration for the `maven-workspace` plugin.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["maven-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"}}},{"description":"Configuration for various `workspace` plugins.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["node-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"},"updatePeerDependencies":{"description":"Also bump peer dependency versions if they are modified. Defaults to `false`.","type":"boolean"}}},{"description":"Directed release dependencies between independently versioned manifest packages, including packages in different workspaces.","type":"object","properties":{"type":{"type":"string","enum":["release-dependencies"]},"rules":{"type":"array","minItems":1,"items":{"type":"object","properties":{"source":{"description":"Source manifest package path.","type":"string","minLength":1},"dependent":{"description":"Dependent manifest package path.","type":"string","minLength":1},"minimumBump":{"description":"Minimum dependent version increase, independent of the source version. Defaults to patch.","enum":["patch","minor","major"]}},"required":["source","dependent"],"additionalProperties":false}}},"required":["type","rules"],"additionalProperties":false},{"description":"Configuration for various `group-priority` plugin","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["group-priority"]},"groups":{"description":"Group names ordered with highest priority first.","type":"array","items":{"type":"string"}}}},{"description":"Other plugins","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","not":{"enum":["release-dependencies"]}}}}]}},"signoff":{"description":"Text to be used as Signed-off-by in the commit.","type":"string"},"group-pull-request-title-pattern":{"description":"When grouping multiple release pull requests use this pattern for the title.","type":"string"},"release-search-depth":{"description":"When considering previously releases, only look this deep.","type":"number"},"commit-search-depth":{"description":"When considering commit history, only look this many commits deep.","type":"number"},"commit-batch-size":{"description":"Number of commits to fetch per API request when searching commit history. Lower values result in more API calls but may help avoid timeouts. Defaults to 10.","type":"number"},"sequential-calls":{"description":"Whether to open pull requests/releases sequentially rather than concurrently. If you have many components, you may want to set this to avoid secondary rate limits.","type":"boolean"},"label":{"description":"Comma-separated list of labels to add to newly opened pull request. These are used to identify release pull requests.","type":"string"},"release-label":{"description":"Comma-separated list of labels to add to a pull request that has been released/tagged","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}},"required":["packages"]}],"properties":{"$schema":true,"packages":true,"bootstrap-sha":true,"last-release-sha":true,"always-link-local":true,"plugins":true,"signoff":true,"group-pull-request-title-pattern":true,"release-search-depth":true,"commit-search-depth":true,"commit-batch-size":true,"sequential-calls":true,"release-type":true,"bump-minor-pre-major":true,"bump-patch-for-minor-pre-major":true,"versioning":true,"changelog-sections":true,"release-as":true,"skip-github-release":true,"skip-changelog":true,"draft":true,"force-tag-creation":true,"prerelease":true,"draft-pull-request":true,"label":true,"release-label":true,"extra-label":true,"include-component-in-tag":true,"include-v-in-tag":true,"include-v-in-release-name":true,"changelog-type":true,"changelog-host":true,"changelog-path":true,"pull-request-title-pattern":true,"pull-request-header":true,"pull-request-footer":true,"separate-pull-requests":true,"always-update":true,"tag-separator":true,"date-format":true,"extra-files":true,"version-file":true,"snapshot-label":true,"initial-version":true,"exclude-paths":true,"component-no-space":false}}');
 
 /***/ }),
 
