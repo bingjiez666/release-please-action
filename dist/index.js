@@ -45917,8 +45917,10 @@ class DefaultChangelogNotes {
             config.types = options.changelogSections;
         }
         const preset = await presetFactory(config);
+        // Release notes reference issues; the original PR or commit owns closure.
+        const defaultCommitPartial = preset.writerOpts.commitPartial.replace(', closes', ', refs');
         preset.writerOpts.commitPartial =
-            this.commitPartial || preset.writerOpts.commitPartial;
+            this.commitPartial || defaultCommitPartial;
         preset.writerOpts.headerPartial =
             this.headerPartial || preset.writerOpts.headerPartial;
         preset.writerOpts.mainTemplate =
